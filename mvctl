@@ -1,0 +1,275 @@
+#!/usr/bin/bash
+
+# Copyright (C) 12020 Jean Lucas <jean@4ray.co>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+wireguard=/etc/wireguard
+
+if ! [[ -x /usr/lib/systemd/systemd ]]; then
+	echo "$(basename "$0")" relies on systemd
+	exit 1
+elif ! [[ -d $wireguard ]]; then
+	echo WireGuard directory not found. Is wireguard-tools installed?
+	exit 1
+fi
+
+existing=$(find /etc/systemd/system/multi-user.target.wants -type l -name "wg-quick*" -printf '%P\n')
+existing_short=$(echo "$existing" | sed 's#wg-quick@##;s#-wireguard.service##')
+sed_profile_short="s#$wireguard/##;s#-wireguard.conf##"
+
+get_profiles() {
+	if ! [[ $(command -v mozwire) ]]; then
+		echo MozWire not installed
+		exit 1
+	fi
+
+	log=mozwire.log
+
+	set -e
+
+	if [[ $(sudo find $wireguard -maxdepth 1 -type f -name \*.conf | wc -l) != 0 ]]; then
+		echo Backing up previous profiles...
+		date=$(date +%Y-%m-%d_%H-%M)
+		sudo mkdir $wireguard/"$date"
+		sudo sh -c "mv $wireguard/{*.conf,$log,$date}"
+	fi
+
+	printf 'Fetching profiles... '
+	profile_tmp=$(mktemp -d --suffix -mozwire)
+	mozwire relay save -n 0 -o "$profile_tmp" &> "$profile_tmp"/$log || {
+		printf 'Failed\n'
+		echo "See $profile_tmp/$log"
+		exit 1
+	}
+	sudo mv "$profile_tmp"/{*.conf,$log} $wireguard
+	rmdir "$profile_tmp"
+	printf 'Success\n'
+}
+
+list_profiles() {
+	sudo sh -c "cd $wireguard; ls *.conf"
+}
+
+get_country_codes() {
+	list_profiles |
+		sed "$sed_profile_short;s#[0-9].*##" |
+		sort -u |
+		tr '\n' ' '
+	echo
+}
+
+get_latencies() {
+	if ! [[ $(command -v fping) ]]; then
+		echo fping not installed
+		exit 1
+	fi
+
+	if [[ -z $1 ]]; then
+		echo Missing country code
+		exit 1
+	fi
+
+	readarray -t profiles <<< "$(sudo find $wireguard -maxdepth 1 -type f -name "$1"\*.conf)"
+
+	if [[ -z ${profiles[*]} ]]; then
+		echo No matching profiles
+		exit 1
+	fi
+
+	echo
+	echo Getting latencies...
+	echo
+
+	declare -A latencies
+
+	for profile in "${profiles[@]}"; do
+		ping=$(fping -e \
+			"$(sudo awk '/Endpoint/ {print $3}' "$profile" | cut -d : -f 1)" |
+			cut -d \  -f 4 |
+			sed 's#(##')
+		profile_short=$(echo "$profile" | sed $sed_profile_short)
+		latencies[$profile_short]=$ping
+		echo "$profile_short: $ping"
+	done
+
+	echo
+	echo Sorting...
+	echo
+
+	for profile in "${!latencies[@]}"; do
+		if [[ -n "${latencies[$profile]}" ]]; then
+			echo "$profile: ${latencies[$profile]}"
+		fi
+	done |
+		sort -rnk 2
+	echo
+}
+
+check_existing() {
+	if [[ -z "$existing" ]]; then
+		echo No profile currently enabled
+		return 1
+	fi
+
+	return 0
+}
+
+which_profile() {
+	if check_existing; then echo "$existing_short"
+	else exit 1
+	fi
+}
+
+is_active() {
+	if [[ $(systemctl is-active "$existing") = active ]]; then return 0
+	else return 1
+	fi
+}
+
+check_profile() {
+	if ! [[ $(sudo ls $wireguard/"$1"-wireguard.conf 2> /dev/null) ]]; then
+		echo Profile not found
+		return 1
+	fi
+
+	new_profile=wg-quick@$1-wireguard.service
+
+	if [[ $new_profile = "$existing" ]]; then
+		echo Profile already enabled
+		return 1
+	fi
+}
+
+enable_profile() {
+	if check_profile "$1"; then
+		if check_existing; then
+			read -rp "$existing_short is currently active. Enabling $1 won't also start it. Proceed? y/n: " confirm_enable
+			while ! [[ $confirm_enable =~ (y|n) ]]; do
+				read -rp 'Invalid response. Enter y/n: ' confirm_enable
+			done
+			if [[ $confirm_enable == y ]]; then disable_existing; else exit 1; fi
+		fi
+	else exit 1
+	fi
+
+	sudo systemctl enable "$new_profile" 2> /dev/null && echo Enabled "$1"
+}
+
+restart_systemd-resolved() {
+	if [[ $(systemctl is-enabled systemd-resolved) == enabled ]]; then
+		sudo systemctl restart systemd-resolved && echo Restarted systemd-resolved
+	else echo Skipping restarting systemd-resolved
+	fi
+}
+
+enable_start_profile() {
+	sudo systemctl enable --now "$new_profile" 2> /dev/null && echo Enabled and started "$1"
+
+	restart_systemd-resolved
+}
+
+start_profile() {
+	if check_existing; then
+		if is_active; then
+			echo "$existing_short" already active
+			exit 1
+		fi
+
+		sudo systemctl start "$existing" && echo Started "$existing_short"
+
+		restart_systemd-resolved
+	elif check_profile "$1"; then
+		if check_existing > /dev/null; then disable_existing; fi
+
+		enable_start_profile "$1"
+	else exit 1
+	fi
+}
+
+restart_profile() {
+	if check_existing; then
+		sudo systemctl restart "$existing" && echo Restarted "$existing_short"
+
+		restart_systemd-resolved
+	elif check_profile "$1"; then enable_start_profile "$1"
+	else exit 1
+	fi
+}
+
+switch_profile() {
+	if [[ -z $1 ]]; then
+		echo Missing profile name
+		exit 1
+	fi
+
+	if check_profile "$1"; then
+		if check_existing; then
+			switching=1
+			disable_existing;
+		fi
+
+		enable_start_profile "$1"
+	else exit 1
+	fi
+}
+
+stop_profile() {
+	if check_existing; then
+		if ! is_active; then
+			echo Profile not active
+			exit 1
+		else
+			sudo systemctl stop "$existing" && echo Stopped "$existing_short"
+
+			if [[ -z $switching ]]; then restart_systemd-resolved; fi
+		fi
+	else exit 1
+	fi
+}
+
+disable_existing() {
+	if check_existing; then
+		sudo systemctl disable "$existing" 2> /dev/null && echo Disabled "$existing_short"
+
+		if is_active; then stop_profile "$existing"; fi
+	else exit 1
+	fi
+}
+
+print_help() {
+	echo "While we wait for the year of Mozilla VPN on the Linux desktop"
+	echo "Jean Lucas <jean@4ray.co>"
+	echo
+	echo "Usage:"
+	echo "    $(basename "$0") [option] {parameter}"
+	echo
+	echo "Options:"
+	echo "    (g)et              Get/update profiles using MozWire"
+	echo "    (l)ist             List available profiles"
+	echo "    (c)c               Get list of available country codes"
+	echo "    (p)ing [cc]        Get sorted server ping by country code using fping"
+	echo "    (w)hich            Show currently enabled profile"
+	echo "    (e)nable [name]    Set new profile"
+	echo "    st(a)rt            Start enabled profile"
+	echo "    (r)estart          Restart enabled profile"
+	echo "    sw(i)tch [name]    Set and start new profile"
+	echo "    st(o)p             Stop enabled profile"
+	echo "    (d)isable          Stop and/or disable enabled profile"
+	exit 1
+}
+
+case $1 in
+	get|g) get_profiles ;;
+	list|l) list_profiles ;;
+	cc|c) get_country_codes ;;
+	ping|p) get_latencies "$2" ;;
+	which|w) which_profile ;;
+	enable|e) enable_profile "$2" ;;
+	start|a) start_profile "$2" ;;
+	restart|r) restart_profile "$2" ;;
+	switch|i) switch_profile "$2" ;;
+	stop|o) stop_profile ;;
+	disable|d) disable_existing ;;
+	*) print_help ;;
+esac
